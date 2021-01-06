@@ -1591,8 +1591,8 @@ Result BinaryWriter::WriteModule() {
       if (err) {
         printf("%s\n", dwarf_errmsg_by_number(dwarf_errno(err)));
       }
-      dwarf_add_AT_location_expr(dwarfProducer, funcDie, DW_AT_frame_base, expr,
-                                 &err);
+      // dwarf_add_AT_location_expr(dwarfProducer, funcDie, DW_AT_frame_base,
+      // expr, &err);
     }
     EndSection();
 
