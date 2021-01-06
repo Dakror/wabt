@@ -350,6 +350,9 @@ set(WABT_LIBRARY_SRC
 
 add_library(wabt STATIC ${WABT_LIBRARY_SRC})
 
+#libdwarf installed on the system
+target_link_libraries(wabt dwarf)
+
 IF (NOT WIN32)
   add_library(wasm-rt-impl STATIC wasm2c/wasm-rt-impl.c wasm2c/wasm-rt-impl.h)
   install(TARGETS wasm-rt-impl DESTINATION ${CMAKE_INSTALL_LIBDIR})

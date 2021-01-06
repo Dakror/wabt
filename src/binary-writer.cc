@@ -24,6 +24,9 @@
 #include <set>
 #include <vector>
 
+#include <libdwarf/dwarf.h>
+#include <libdwarf/libdwarf.h>
+
 #include "config.h"
 
 #include "src/binary.h"
@@ -35,6 +38,8 @@
 
 #define PRINT_HEADER_NO_INDEX -1
 #define MAX_U32_LEB128_BYTES 5
+
+#define DW_OP_WASM_location 0xed
 
 namespace wabt {
 
@@ -167,7 +172,9 @@ class Symbol {
   bool undefined() const { return flags() & WABT_SYMBOL_FLAG_UNDEFINED; }
   bool defined() const { return !undefined(); }
   bool exported() const { return flags() & WABT_SYMBOL_FLAG_EXPORTED; }
-  bool explicit_name() const { return flags() & WABT_SYMBOL_FLAG_EXPLICIT_NAME; }
+  bool explicit_name() const {
+    return flags() & WABT_SYMBOL_FLAG_EXPLICIT_NAME;
+  }
   bool no_strip() const { return flags() & WABT_SYMBOL_FLAG_NO_STRIP; }
 
   bool IsFunction() const { return type() == Function::type; }
@@ -216,8 +223,10 @@ class SymbolTable {
 
   Result EnsureUnique(const string_view& name) {
     if (seen_names_.count(name)) {
-      fprintf(stderr, "error: duplicate symbol when writing relocatable "
-              "binary: %s\n", &name[0]);
+      fprintf(stderr,
+              "error: duplicate symbol when writing relocatable "
+              "binary: %s\n",
+              &name[0]);
       return Result::Error;
     }
     seen_names_.insert(name);
@@ -225,8 +234,11 @@ class SymbolTable {
   };
 
   template <typename T>
-  Result AddSymbol(std::vector<Index>* map, string_view name,
-                   bool imported, bool exported, T&& sym) {
+  Result AddSymbol(std::vector<Index>* map,
+                   string_view name,
+                   bool imported,
+                   bool exported,
+                   T&& sym) {
     uint8_t flags = 0;
     if (imported) {
       flags |= WABT_SYMBOL_FLAG_UNDEFINED;
@@ -279,20 +291,20 @@ class SymbolTable {
 
     for (const Export* export_ : module->exports) {
       switch (export_->kind) {
-      case ExternalKind::Func:
-        exported_funcs.insert(module->GetFuncIndex(export_->var));
-        break;
-      case ExternalKind::Table:
-        exported_tables.insert(module->GetTableIndex(export_->var));
-        break;
-      case ExternalKind::Memory:
-        break;
-      case ExternalKind::Global:
-        exported_globals.insert(module->GetGlobalIndex(export_->var));
-        break;
-      case ExternalKind::Event:
-        exported_events.insert(module->GetEventIndex(export_->var));
-        break;
+        case ExternalKind::Func:
+          exported_funcs.insert(module->GetFuncIndex(export_->var));
+          break;
+        case ExternalKind::Table:
+          exported_tables.insert(module->GetTableIndex(export_->var));
+          break;
+        case ExternalKind::Memory:
+          break;
+        case ExternalKind::Global:
+          exported_globals.insert(module->GetGlobalIndex(export_->var));
+          break;
+        case ExternalKind::Event:
+          exported_events.insert(module->GetEventIndex(export_->var));
+          break;
       }
     }
 
@@ -396,6 +408,12 @@ class BinaryWriter {
   std::vector<RelocSection> reloc_sections_;
   RelocSection* current_reloc_section_ = nullptr;
 
+  Dwarf_P_Debug dwarfProducer;
+  std::vector<const char*> customSectionNames;
+  Dwarf_P_Die rootDwarfDie;
+  Dwarf_P_Die currentFunctionDie;
+  std::unordered_map<const char*, Dwarf_Unsigned> dwarfFiles;
+
   Index section_count_ = 0;
   size_t last_section_offset_ = 0;
   size_t last_section_leb_size_guess_ = 0;
@@ -485,7 +503,8 @@ void BinaryWriter::WriteBlockDecl(const BlockDeclaration& decl) {
   Index index = decl.has_func_type ? module_->GetFuncTypeIndex(decl.type_var)
                                    : module_->GetFuncTypeIndex(decl.sig);
   assert(index != kInvalidIndex);
-  WriteS32Leb128WithReloc(index, "block type function index", RelocType::TypeIndexLEB);
+  WriteS32Leb128WithReloc(index, "block type function index",
+                          RelocType::TypeIndexLEB);
 }
 
 void BinaryWriter::WriteSectionHeader(const char* desc,
@@ -570,7 +589,8 @@ void BinaryWriter::AddReloc(RelocType reloc_type, Index index) {
   // Add a new reloc section if needed
   if (!current_reloc_section_ ||
       current_reloc_section_->section_index != section_count_) {
-    reloc_sections_.emplace_back(GetSectionName(last_section_type_), section_count_);
+    reloc_sections_.emplace_back(GetSectionName(last_section_type_),
+                                 section_count_);
     current_reloc_section_ = &reloc_sections_.back();
   }
 
@@ -609,8 +629,7 @@ void BinaryWriter::WriteS32Leb128WithReloc(int32_t value,
   }
 }
 
-void BinaryWriter::WriteTableNumberWithReloc(Index value,
-                                             const char* desc) {
+void BinaryWriter::WriteTableNumberWithReloc(Index value, const char* desc) {
   // Unless reference types are enabled, all references to tables refer to table
   // 0, so no relocs need be emitted when making relocatable binaries.
   if (options_.relocatable && options_.features.reference_types_enabled()) {
@@ -646,6 +665,14 @@ void BinaryWriter::WriteLoadStoreExpr(const Func* func,
 }
 
 void BinaryWriter::WriteExpr(const Func* func, const Expr* expr) {
+  if (currentFunctionDie) {
+    Dwarf_Error err;
+    dwarf_add_line_entry_b(
+        dwarfProducer, dwarfFiles.at(expr->loc.filename.data()),
+        stream_->offset() - code_start_, expr->loc.line, expr->loc.first_column,
+        false, false, false, false, 0, 0, &err);
+  }
+
   switch (expr->type()) {
     case ExprType::AtomicLoad:
       WriteLoadStoreExpr<AtomicLoadExpr>(func, expr, "memory offset");
@@ -713,7 +740,7 @@ void BinaryWriter::WriteExpr(const Func* func, const Expr* expr) {
       WriteU32Leb128(stream_, depth, "break depth for default");
       break;
     }
-    case ExprType::Call:{
+    case ExprType::Call: {
       Index index = module_->GetFuncIndex(cast<CallExpr>(expr)->var);
       WriteOpcode(stream_, Opcode::Call);
       WriteU32Leb128WithReloc(index, "function index", RelocType::FuncIndexLEB);
@@ -725,13 +752,14 @@ void BinaryWriter::WriteExpr(const Func* func, const Expr* expr) {
       WriteU32Leb128WithReloc(index, "function index", RelocType::FuncIndexLEB);
       break;
     }
-    case ExprType::CallIndirect:{
+    case ExprType::CallIndirect: {
       Index sig_index =
-        module_->GetFuncTypeIndex(cast<CallIndirectExpr>(expr)->decl);
+          module_->GetFuncTypeIndex(cast<CallIndirectExpr>(expr)->decl);
       Index table_index =
-        module_->GetTableIndex(cast<CallIndirectExpr>(expr)->table);
+          module_->GetTableIndex(cast<CallIndirectExpr>(expr)->table);
       WriteOpcode(stream_, Opcode::CallIndirect);
-      WriteU32Leb128WithReloc(sig_index, "signature index", RelocType::TypeIndexLEB);
+      WriteU32Leb128WithReloc(sig_index, "signature index",
+                              RelocType::TypeIndexLEB);
       WriteTableNumberWithReloc(table_index, "table index");
       break;
     }
@@ -741,7 +769,8 @@ void BinaryWriter::WriteExpr(const Func* func, const Expr* expr) {
       Index table_index =
           module_->GetTableIndex(cast<ReturnCallIndirectExpr>(expr)->table);
       WriteOpcode(stream_, Opcode::ReturnCallIndirect);
-      WriteU32Leb128WithReloc(sig_index, "signature index", RelocType::TypeIndexLEB);
+      WriteU32Leb128WithReloc(sig_index, "signature index",
+                              RelocType::TypeIndexLEB);
       WriteTableNumberWithReloc(table_index, "table index");
       break;
     }
@@ -840,8 +869,7 @@ void BinaryWriter::WriteExpr(const Func* func, const Expr* expr) {
       WriteU32Leb128(stream_, 0, "memory.copy reserved");
       break;
     case ExprType::DataDrop: {
-      Index index =
-          module_->GetDataSegmentIndex(cast<DataDropExpr>(expr)->var);
+      Index index = module_->GetDataSegmentIndex(cast<DataDropExpr>(expr)->var);
       WriteOpcode(stream_, Opcode::DataDrop);
       WriteU32Leb128(stream_, index, "data.drop segment");
       has_data_segment_instruction_ = true;
@@ -878,8 +906,7 @@ void BinaryWriter::WriteExpr(const Func* func, const Expr* expr) {
       break;
     }
     case ExprType::ElemDrop: {
-      Index index =
-          module_->GetElemSegmentIndex(cast<ElemDropExpr>(expr)->var);
+      Index index = module_->GetElemSegmentIndex(cast<ElemDropExpr>(expr)->var);
       WriteOpcode(stream_, Opcode::ElemDrop);
       WriteU32Leb128(stream_, index, "elem.drop segment");
       break;
@@ -895,36 +922,31 @@ void BinaryWriter::WriteExpr(const Func* func, const Expr* expr) {
       break;
     }
     case ExprType::TableGet: {
-      Index index =
-          module_->GetTableIndex(cast<TableGetExpr>(expr)->var);
+      Index index = module_->GetTableIndex(cast<TableGetExpr>(expr)->var);
       WriteOpcode(stream_, Opcode::TableGet);
       WriteTableNumberWithReloc(index, "table.get table index");
       break;
     }
     case ExprType::TableSet: {
-      Index index =
-          module_->GetTableIndex(cast<TableSetExpr>(expr)->var);
+      Index index = module_->GetTableIndex(cast<TableSetExpr>(expr)->var);
       WriteOpcode(stream_, Opcode::TableSet);
       WriteTableNumberWithReloc(index, "table.set table index");
       break;
     }
     case ExprType::TableGrow: {
-      Index index =
-          module_->GetTableIndex(cast<TableGrowExpr>(expr)->var);
+      Index index = module_->GetTableIndex(cast<TableGrowExpr>(expr)->var);
       WriteOpcode(stream_, Opcode::TableGrow);
       WriteTableNumberWithReloc(index, "table.grow table index");
       break;
     }
     case ExprType::TableSize: {
-      Index index =
-          module_->GetTableIndex(cast<TableSizeExpr>(expr)->var);
+      Index index = module_->GetTableIndex(cast<TableSizeExpr>(expr)->var);
       WriteOpcode(stream_, Opcode::TableSize);
       WriteTableNumberWithReloc(index, "table.size table index");
       break;
     }
     case ExprType::TableFill: {
-      Index index =
-          module_->GetTableIndex(cast<TableFillExpr>(expr)->var);
+      Index index = module_->GetTableIndex(cast<TableFillExpr>(expr)->var);
       WriteOpcode(stream_, Opcode::TableFill);
       WriteTableNumberWithReloc(index, "table.fill table index");
       break;
@@ -1042,7 +1064,10 @@ void BinaryWriter::WriteFuncLocals(const Func* func,
 void BinaryWriter::WriteFunc(const Func* func) {
   WriteFuncLocals(func, func->local_types);
   WriteExprList(func, func->exprs);
+  Dwarf_Error err;
   WriteOpcode(stream_, Opcode::End);
+  dwarf_lne_end_sequence_a(dwarfProducer, stream_->offset() - code_start_,
+                           &err);
 }
 
 void BinaryWriter::WriteTable(const Table* table) {
@@ -1200,6 +1225,39 @@ void BinaryWriter::WriteNames(const std::vector<T*>& elems,
 }
 
 Result BinaryWriter::WriteModule() {
+  Dwarf_Error err = 0;
+  dwarf_producer_init(
+      DW_DLC_WRITE | DW_DLC_SYMBOLIC_RELOCATIONS,
+      [](const char* name, int size, Dwarf_Unsigned type, Dwarf_Unsigned flags,
+         Dwarf_Unsigned link, Dwarf_Unsigned info,
+         Dwarf_Unsigned* sect_name_index, void* user_data, int* error) {
+        if (!strncmp(name, ".rel", 4))
+          return 0;
+        auto ctx = reinterpret_cast<BinaryWriter*>(user_data);
+        ctx->customSectionNames.emplace_back(name);
+        return static_cast<int>(ctx->customSectionNames.size());
+      },
+      [](Dwarf_Error error, Dwarf_Ptr errarg) {}, nullptr, this, "x86", "V4",
+      "default_is_stmt=1,opcode_base=13,line_base=-5,line_range=14",
+      &dwarfProducer, &err);
+  dwarf_pro_set_default_string_form(dwarfProducer, DW_FORM_strp, &err);
+
+  dwarfFiles.insert(
+      {module_->loc.filename.data(),
+       dwarf_add_file_decl(dwarfProducer,
+                           const_cast<char*>(module_->loc.filename.data()), 0,
+                           0, 0, &err)});
+  Dwarf_P_Die rootDie = dwarf_new_die(dwarfProducer, DW_TAG_compile_unit, NULL,
+                                      NULL, NULL, NULL, &err);
+  dwarf_add_AT_producer(rootDie, "WABT", &err);
+  dwarf_add_AT_name(rootDie, const_cast<char*>(module_->loc.filename.data()),
+                    &err);
+  dwarf_add_AT_comp_dir(rootDie, "/home/dakror/Desktop/tasks", &err);
+  dwarf_add_AT_flag(dwarfProducer, rootDie, DW_AT_language, DW_LANG_C, &err);
+  dwarf_add_AT_targ_address(dwarfProducer, rootDie, DW_AT_low_pc, 0, 0, &err);
+
+  currentFunctionDie = nullptr;
+
   stream_->WriteU32(WABT_BINARY_MAGIC, "WASM_BINARY_MAGIC");
   stream_->WriteU32(WABT_BINARY_VERSION, "WASM_BINARY_VERSION");
 
@@ -1455,7 +1513,8 @@ Result BinaryWriter::WriteModule() {
 
             case ElemExprKind::RefFunc:
               WriteOpcode(stream_, Opcode::RefFunc);
-              WriteU32Leb128(stream_, module_->GetFuncIndex(elem_expr.var), "elem expr function index");
+              WriteU32Leb128(stream_, module_->GetFuncIndex(elem_expr.var),
+                             "elem expr function index");
               break;
           }
           WriteOpcode(stream_, Opcode::End);
@@ -1463,7 +1522,8 @@ Result BinaryWriter::WriteModule() {
       } else {
         for (const ElemExpr& elem_expr : segment->elem_exprs) {
           assert(elem_expr.kind == ElemExprKind::RefFunc);
-          WriteU32Leb128(stream_, module_->GetFuncIndex(elem_expr.var), "elem function index");
+          WriteU32Leb128(stream_, module_->GetFuncIndex(elem_expr.var),
+                         "elem function index");
         }
       }
     }
@@ -1489,6 +1549,10 @@ Result BinaryWriter::WriteModule() {
       WriteHeader("function body", i);
       const Func* func = module_->funcs[i + module_->num_func_imports];
 
+      Dwarf_P_Die funcDie = dwarf_new_die(dwarfProducer, DW_TAG_subprogram,
+                                          rootDie, NULL, NULL, NULL, &err);
+      currentFunctionDie = funcDie;
+
       /* TODO(binji): better guess of the size of the function body section */
       const Offset leb_size_guess = 1;
       Offset body_size_offset =
@@ -1497,16 +1561,42 @@ Result BinaryWriter::WriteModule() {
       auto func_start_offset = body_size_offset - last_section_payload_offset_;
       auto func_end_offset = stream_->offset() - last_section_payload_offset_;
       auto delta = WriteFixupU32Leb128Size(body_size_offset, leb_size_guess,
-                              "FIXUP func body size");
+                                           "FIXUP func body size");
       if (current_reloc_section_ && delta != 0) {
         for (Reloc& reloc : current_reloc_section_->relocations) {
-          if (reloc.offset >= func_start_offset && reloc.offset <= func_end_offset) {
+          if (reloc.offset >= func_start_offset &&
+              reloc.offset <= func_end_offset) {
             reloc.offset += delta;
           }
         }
       }
+
+      dwarf_add_AT_name(funcDie, const_cast<char*>(func->name.c_str() + 1),
+                        &err);
+      dwarf_add_AT_unsigned_const(
+          dwarfProducer, funcDie, DW_AT_decl_file,
+          dwarfFiles.at(func->exprs.front().loc.filename.data()), &err);
+      dwarf_add_AT_unsigned_const(dwarfProducer, funcDie, DW_AT_decl_line,
+                                  func->exprs.front().loc.line, &err);
+      dwarf_add_AT_targ_address(dwarfProducer, funcDie, DW_AT_low_pc,
+                                func_start_offset, 0, &err);
+      dwarf_add_AT_targ_address(dwarfProducer, funcDie, DW_AT_high_pc,
+                                func_end_offset, 0, &err);
+      auto expr = dwarf_new_expr(dwarfProducer, &err);
+      // dwarf_add_expr_gen(expr, DW_OP_WASM_location, 0, 1, &err);
+      if (err) {
+        printf("%s\n", dwarf_errmsg_by_number(dwarf_errno(err)));
+      }
+      // dwarf_add_expr_gen(expr, DW_OP_stack_value, 0, 0, &err);
+      if (err) {
+        printf("%s\n", dwarf_errmsg_by_number(dwarf_errno(err)));
+      }
+      dwarf_add_AT_location_expr(dwarfProducer, funcDie, DW_AT_frame_base, expr,
+                                 &err);
     }
     EndSection();
+
+    currentFunctionDie = nullptr;
   }
 
   // Remove the DataCount section if there are no instructions that require it.
@@ -1610,6 +1700,27 @@ Result BinaryWriter::WriteModule() {
       WriteRelocSection(&section);
     }
   }
+
+  /////////////////////////////////////////////
+
+  dwarf_add_die_to_debug_a(dwarfProducer, rootDie, &err);
+  Dwarf_Signed sections = dwarf_transform_to_disk_form(dwarfProducer, &err);
+  for (int i = 0; i < sections; ++i) {
+    Dwarf_Unsigned length;
+    Dwarf_Signed section_idx;
+    Dwarf_Ptr section_bytes;
+    char* name;
+    Dwarf_Addr addr;
+    Dwarf_Unsigned size;
+    dwarf_get_section_bytes_a(dwarfProducer, i, &section_idx, &length,
+                              &section_bytes, &err);
+
+    BeginCustomSection(customSectionNames[section_idx - 1]);
+    stream_->WriteData(section_bytes, length);
+    EndSection();
+  }
+
+  dwarf_producer_finish(dwarfProducer, &err);
 
   return stream_->result();
 }
